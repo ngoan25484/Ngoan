@@ -1,0 +1,5 @@
+{
+  "name": "Nguyễn Trong Ngoan - Trộn Đề Toán THPT",
+  "description": "Ứng dụng chuyên nghiệp hỗ trợ giáo viên trộn đề thi trắc nghiệm Toán THPT từ file Word (.docx), giữ nguyên định dạng công thức và hình ảnh. Tích hợp AI để kiểm tra lỗi đề.",
+  "requestFramePermissions": []
+}
