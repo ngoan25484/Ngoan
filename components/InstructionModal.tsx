@@ -38,6 +38,7 @@ export const InstructionModal: React.FC<InstructionModalProps> = ({ isOpen, onCl
               <li>Sử dụng <strong>MathType</strong> hoặc <strong>Equation</strong> gốc của Word cho công thức toán.</li>
               <li>Mỗi câu hỏi phải bắt đầu bằng từ khóa <strong>"Câu [số]:"</strong> (Ví dụ: <em>Câu 1:</em>, <em>Câu 2.</em>).</li>
               <li>Phần chia nhóm (nếu có) dùng: <strong>PHẦN I.</strong>, <strong>PHẦN II.</strong>...</li>
+              <li><strong>Phần IV (Tự luận)</strong> sẽ được giữ nguyên thứ tự câu hỏi khi trộn.</li>
               <li>Để chèn mã đề tự động vào nội dung, hãy dùng ký hiệu: <code className="bg-gray-100 px-1 rounded text-red-500 font-mono">[MA_DE]</code>.</li>
             </ul>
           </section>

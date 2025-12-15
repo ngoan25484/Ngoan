@@ -11,6 +11,7 @@ export enum QuestionType {
   MCQ = 'MCQ',         // A. B. C. D.
   TRUE_FALSE = 'TF',   // a) b) c) d)
   SHORT_ANSWER = 'SA', // <Key=...>
+  ESSAY = 'ESSAY',     // Tự luận (Phần IV)
   UNKNOWN = 'UNKNOWN'
 }
 

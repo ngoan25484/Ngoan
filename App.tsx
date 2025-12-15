@@ -157,7 +157,7 @@ const App: React.FC = () => {
             </div>
             <div className="flex items-baseline gap-2">
               <h1 className="text-xl font-bold text-slate-800 tracking-tight">MathMixer <span className="text-primary">Pro</span></h1>
-              <span className="px-1.5 py-0.5 rounded text-xs font-bold bg-slate-100 text-slate-500 border border-slate-200">v1.0</span>
+              <span className="px-1.5 py-0.5 rounded text-xs font-bold bg-slate-100 text-slate-500 border border-slate-200">v1.1</span>
             </div>
           </div>
           <div className="text-sm text-slate-500 font-medium">Hỗ trợ bởi Google Gemini</div>

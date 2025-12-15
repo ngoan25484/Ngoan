@@ -24,8 +24,9 @@ const OPTION_PREFIX_REGEX = /^(\s*)([A-D]|[a-d])(\s*)([\.\)\:])/;
 // 3. Regex tìm thẻ Key (để lấy đáp án đưa vào Excel)
 const KEY_REGEX_EXTRACT = /<Key\s*=\s*([^>]*)>/i;
 
-// 4. Regex để xóa thẻ Key ra khỏi file xuất
-const KEY_TAG_REMOVE_REGEX = /\s*<Key[^>]*>/gi;
+// 4. Regex để xóa thẻ Key ra khỏi file xuất (Tìm cụm <Key=*>)
+// Lưu ý: Regex này dùng để match trên text đã gộp, không dùng trực tiếp test trên node lẻ
+const KEY_TAG_REMOVE_PATTERN = "\\s*<Key\\s*=[^>]*>";
 
 // Helper to shuffle array (Fisher-Yates)
 const shuffleArray = <T>(array: T[]): T[] => {
@@ -83,7 +84,13 @@ const isQuestionStart = (text: string): boolean => {
 
 const isSectionHeader = (text: string): boolean => {
   const regex = /^PHẦN\s+[IVX]+\./i;
-  return regex.test(text.trim());
+  // Bổ sung nhận diện phần Tự luận nếu tiêu đề không bắt đầu bằng "PHẦN..." nhưng chứa "TỰ LUẬN"
+  return regex.test(text.trim()) || /TỰ\s+LUẬN/i.test(text.trim());
+};
+
+const isEssaySectionLabel = (text: string): boolean => {
+    // Nhận diện Phần IV hoặc chữ Tự Luận
+    return /PHẦN\s+(IV|4)/i.test(text) || /TỰ\s+LUẬN/i.test(text);
 };
 
 const hasUnderline = (pNode: Element): boolean => {
@@ -180,7 +187,17 @@ export const processDocxFile = async (file: File): Promise<ProcessedDoc> => {
         let hasKey = KEY_REGEX_EXTRACT.test(currentSegment.textContent);
         let optionNodeCount = 0;
         
-        const qType = detectType(currentSegment.textContent);
+        let qType = detectType(currentSegment.textContent);
+
+        // LOGIC QUAN TRỌNG: Xử lý Tự luận (Phần IV)
+        // Nếu câu hỏi nằm trong vùng "Tự Luận" hoặc "Phần IV"
+        // VÀ kiểu chưa xác định (do không có A,B,C,D) HOẶC là Short Answer nhưng ko có Key (trường hợp hiếm)
+        // -> Gán cứng là ESSAY và coi là hợp lệ.
+        if (isEssaySectionLabel(currentSectionLabel)) {
+             if (qType === QuestionType.UNKNOWN) {
+                 qType = QuestionType.ESSAY;
+             }
+        }
 
         accumulatedNodes.forEach(node => {
            if (node.nodeName === 'w:p') {
@@ -206,9 +223,16 @@ export const processDocxFile = async (file: File): Promise<ProcessedDoc> => {
           detectedOptionNodes: optionNodeCount
         };
         
+        // Validation logic
         if (qBlock.type === QuestionType.MCQ && !qBlock.hasUnderline) qBlock.isValid = false;
         if (qBlock.type === QuestionType.TRUE_FALSE && !qBlock.hasUnderline) qBlock.isValid = false;
         if (qBlock.type === QuestionType.SHORT_ANSWER && !qBlock.hasKeyTag) qBlock.isValid = false;
+        
+        // ESSAY is always valid if it has content
+        if (qBlock.type === QuestionType.ESSAY) {
+            qBlock.isValid = true;
+        }
+        
         if (qBlock.type === QuestionType.UNKNOWN) qBlock.isValid = false;
 
         questions.push(qBlock);
@@ -307,6 +331,20 @@ export const getValidationIssues = (questions: QuestionBlock[]): ValidationIssue
             severity: 'error'
           });
         }
+    } else if (q.type === QuestionType.ESSAY) {
+        // Essay questions generally don't need validation like keys or underlines
+        // unless they are empty
+        if (!q.textContent || q.textContent.trim().length < 5) {
+             issues.push({
+                questionId: q.id,
+                questionIndex: index,
+                questionLabel: q.label,
+                questionType: q.type,
+                issue: "Nội dung câu tự luận quá ngắn hoặc trống.",
+                suggestion: "Kiểm tra lại nội dung câu hỏi.",
+                severity: 'warning'
+              });
+        }
     } else if (q.type === QuestionType.UNKNOWN) {
          issues.push({
             questionId: q.id,
@@ -314,7 +352,7 @@ export const getValidationIssues = (questions: QuestionBlock[]): ValidationIssue
             questionLabel: q.label,
             questionType: q.type,
             issue: "Không nhận diện được dạng câu hỏi.",
-            suggestion: "Kiểm tra lại định dạng (A. B. C. D. hoặc a) b) c) d)).",
+            suggestion: "Kiểm tra lại định dạng. Nếu là tự luận, hãy đảm bảo nó nằm trong phần có tiêu đề 'PHẦN IV' hoặc 'TỰ LUẬN'.",
             severity: 'error'
           });
     }
@@ -448,13 +486,68 @@ const replaceOptionLabel = (node: Node, newLabel: string, separator: string = ".
   return false;
 };
 
-const cleanTextContent = (node: Node) => {
-  if (node.nodeName === "w:t" && node.textContent) {
-    if (KEY_TAG_REMOVE_REGEX.test(node.textContent)) {
-        node.textContent = node.textContent.replace(KEY_TAG_REMOVE_REGEX, "");
+// Robust function to clean Key tags even if they are split across multiple w:t nodes
+const cleanKeyTagFromParagraph = (pNode: Node) => {
+    // 1. Map nodes
+    const textNodes: { node: Node, text: string, start: number, end: number }[] = [];
+    let currentPos = 0;
+    
+    const collect = (n: Node) => {
+        if (n.nodeName === "w:t" && n.textContent) {
+            const len = n.textContent.length;
+            textNodes.push({ node: n, text: n.textContent, start: currentPos, end: currentPos + len });
+            currentPos += len;
+        } else {
+            n.childNodes.forEach(c => collect(c));
+        }
     }
-  }
-  node.childNodes.forEach(child => cleanTextContent(child));
+    collect(pNode);
+    if (textNodes.length === 0) return;
+
+    const fullText = textNodes.map(t => t.text).join("");
+    
+    // 2. Find removal ranges
+    const regex = new RegExp(KEY_TAG_REMOVE_PATTERN, "gi");
+    let match;
+    const rangesToRemove: {start: number, end: number}[] = [];
+    while ((match = regex.exec(fullText)) !== null) {
+        rangesToRemove.push({ start: match.index, end: match.index + match[0].length });
+    }
+    
+    if (rangesToRemove.length === 0) return;
+
+    // 3. Update nodes
+    textNodes.forEach(tNode => {
+        // Find ranges that overlap with this node
+        const nodeRanges = rangesToRemove.filter(r => r.start < tNode.end && r.end > tNode.start);
+        
+        if (nodeRanges.length === 0) return; // No changes for this node
+
+        // We reconstruct the node text
+        // The parts of the node TO KEEP are those NOT in nodeRanges
+        
+        const nodeText = tNode.text;
+        let builtText = "";
+        let lastKeptIndex = 0; // relative to node text
+
+        nodeRanges.forEach(r => {
+            // Intersect range r with node range [start, end]
+            // Convert intersection to local coords [0, length]
+            const rStartLocal = Math.max(0, r.start - tNode.start);
+            const rEndLocal = Math.min(nodeText.length, r.end - tNode.start);
+            
+            if (rStartLocal > lastKeptIndex) {
+                builtText += nodeText.substring(lastKeptIndex, rStartLocal);
+            }
+            lastKeptIndex = Math.max(lastKeptIndex, rEndLocal);
+        });
+        
+        if (lastKeptIndex < nodeText.length) {
+            builtText += nodeText.substring(lastKeptIndex);
+        }
+        
+        tNode.node.textContent = builtText;
+    });
 };
 
 // Cập nhật mã đề và định dạng canh phải (Right Align)
@@ -648,6 +741,11 @@ const getAnswerFromNodes = (nodes: Element[], type: QuestionType, originalText: 
     return match ? match[1].trim() : "";
   }
   
+  // ESSAY has no specific answer key for automated grading
+  if (type === QuestionType.ESSAY) {
+    return ""; // Or return "TL" if desired
+  }
+  
   const labelsMCQ = ['A', 'B', 'C', 'D'];
   
   if (type === QuestionType.MCQ) {
@@ -691,6 +789,9 @@ const getAnswerFromNodes = (nodes: Element[], type: QuestionType, originalText: 
 };
 
 const shuffleQuestionOptions = (nodes: Element[], type: QuestionType, targetLabel?: string): Element[] => {
+  // Essay questions do not have options to shuffle
+  if (type === QuestionType.ESSAY) return nodes;
+
   const optionIndices: number[] = [];
   let correctOptionIndexOriginal = -1;
   let detectedSeparator = "."; // Default separator
@@ -767,58 +868,106 @@ const shuffleQuestionOptions = (nodes: Element[], type: QuestionType, targetLabe
   return newNodes;
 };
 
-// --- LOGIC DÀN TRANG 1 DÒNG HOẶC 2 DÒNG ---
+// --- LOGIC DÀN TRANG (LAYOUT OPTIMIZATION) ---
+
+const setupParagraphTab = (pNode: Element, doc: Document, tabPositions: number[]) => {
+    let pPr = pNode.getElementsByTagName("w:pPr")[0];
+    if (!pPr) {
+        pPr = doc.createElementNS(W_NAMESPACE, "w:pPr");
+        pNode.insertBefore(pPr, pNode.firstChild);
+    }
+    
+    // Remove existing tabs to avoid conflict
+    const oldTabs = pPr.getElementsByTagName("w:tabs")[0];
+    if (oldTabs) pPr.removeChild(oldTabs);
+
+    const tabs = doc.createElementNS(W_NAMESPACE, "w:tabs");
+    
+    tabPositions.forEach(pos => {
+        const tab = doc.createElementNS(W_NAMESPACE, "w:tab");
+        tab.setAttribute("w:val", "left");
+        tab.setAttribute("w:pos", Math.round(pos).toString());
+        tabs.appendChild(tab);
+    });
+    
+    pPr.appendChild(tabs);
+};
 
 const reformatMCQLayout = (nodes: Element[], doc: Document): Element[] => {
-  // Only applicable if we have exactly 4 nodes that are presumably A, B, C, D
+  // Chỉ áp dụng nếu có đúng 4 nodes (A, B, C, D)
   if (nodes.length !== 4) return nodes;
 
-  const totalLength = nodes.reduce((acc, node) => acc + (node.textContent?.length || 0), 0);
+  // 1. Calculate MAX Length of option texts
+  const lengths = nodes.map(n => {
+     let textLen = (n.textContent || "").replace(/\s+/g, ' ').trim().length;
+     // Check for Math formulas (m:oMath) or Images (w:drawing)
+     // If present, add virtual weight to avoid squeezing complex items
+     if (n.getElementsByTagName("m:oMath").length > 0 || n.getElementsByTagName("w:drawing").length > 0) {
+        textLen += 20; 
+     }
+     return textLen;
+  });
   
-  // Constants for thresholds (approx chars)
-  // 1 line: e.g., "A. 1   B. 2   C. 3   D. 4" (approx < 60 chars total)
-  // 2 lines: e.g., "A. x+y=2   B. x-y=4" (approx < 160 chars total)
-  
-  const CHARS_LIMIT_1_LINE = 60;
-  const CHARS_LIMIT_2_LINES = 160;
+  const maxLength = Math.max(...lengths);
 
-  const mergeParagraphs = (pDest: Element, pSource: Element) => {
-      // Create Tab element
+  /**
+   * Helper: Merge content from pSource into pDest and add a TAB separator
+   */
+  const mergeParagraphsWithTab = (pDest: Element, pSource: Element) => {
+      // 1. Create Run containing Tab
       const rTab = doc.createElementNS(W_NAMESPACE, "w:r");
       const tab = doc.createElementNS(W_NAMESPACE, "w:tab");
       rTab.appendChild(tab);
       pDest.appendChild(rTab);
 
-      // Move relevant content nodes from source to dest
-      // We skip pPr (properties) as we want to keep dest properties
-      const children = Array.from(pSource.childNodes);
-      children.forEach(child => {
-          if (child.nodeName !== "w:pPr") {
-              pDest.appendChild(child);
-          }
+      // 2. Move ALL content nodes (w:r, w:hyperlink, w:oMath...) from Source to Dest
+      // IMPORTANT: Do NOT move w:pPr (properties)
+      const childrenToMove: Node[] = [];
+      pSource.childNodes.forEach(child => {
+         if (child.nodeName !== 'w:pPr') {
+             childrenToMove.push(child);
+         }
+      });
+
+      childrenToMove.forEach(child => {
+          pDest.appendChild(child);
       });
   };
 
-  if (totalLength < CHARS_LIMIT_1_LINE) {
-      // Merge all into nodes[0]
+  // --- CASE 1: 4 Cột (1 Dòng) ---
+  // Điều kiện: Max Length <= 10
+  if (maxLength <= 10) {
       const base = nodes[0];
-      mergeParagraphs(base, nodes[1]);
-      mergeParagraphs(base, nodes[2]);
-      mergeParagraphs(base, nodes[3]);
-      return [base];
-  } else if (totalLength < CHARS_LIMIT_2_LINES) {
-      // Row 1: Node 0 + Node 1
-      const row1 = nodes[0];
-      mergeParagraphs(row1, nodes[1]);
+      mergeParagraphsWithTab(base, nodes[1]);
+      mergeParagraphsWithTab(base, nodes[2]);
+      mergeParagraphsWithTab(base, nodes[3]);
       
-      // Row 2: Node 2 + Node 3
+      // Setup distributed tabs: 2250 (1/4), 4500 (1/2), 6750 (3/4)
+      setupParagraphTab(base, doc, [2250, 4500, 6750]);
+      
+      return [base];
+  }
+
+  // --- CASE 2: 2 Cột (2 Dòng) ---
+  // Điều kiện: Max Length <= 30
+  if (maxLength <= 30) {
+      // Row 1: A + Tab + B
+      const row1 = nodes[0];
+      mergeParagraphsWithTab(row1, nodes[1]);
+      
+      // Row 2: C + Tab + D
       const row2 = nodes[2];
-      mergeParagraphs(row2, nodes[3]);
+      mergeParagraphsWithTab(row2, nodes[3]);
+      
+      // Tab stop at Center (4500)
+      setupParagraphTab(row1, doc, [4500]);
+      setupParagraphTab(row2, doc, [4500]);
       
       return [row1, row2];
   }
 
-  // Else keep 4 lines
+  // --- CASE 3: 1 Cột (4 Dòng) ---
+  // Fallback: Giữ nguyên
   return nodes;
 };
 
@@ -852,22 +1001,29 @@ export const generateVariants = async (
   const p2Questions = questions.filter(q => /PHẦN\s+II\./i.test(q.section));
   const p3Questions = questions.filter(q => /PHẦN\s+III\./i.test(q.section));
   
+  // Logic bổ sung cho PHẦN IV (Tự luận)
+  const p4Questions = questions.filter(q => /PHẦN\s+(IV|4)\./i.test(q.section) || /TỰ\s+LUẬN/i.test(q.section));
+  
   // Remaining questions (e.g. if no sections or unmatched)
   const otherQuestions = questions.filter(q => 
     !/PHẦN\s+I\./i.test(q.section) && 
     !/PHẦN\s+II\./i.test(q.section) && 
-    !/PHẦN\s+III\./i.test(q.section)
+    !/PHẦN\s+III\./i.test(q.section) &&
+    !/PHẦN\s+(IV|4)\./i.test(q.section) && 
+    !/TỰ\s+LUẬN/i.test(q.section)
   );
   
   const header1Segment = segments.find(s => s.type === 'static' && s.textContent.match(/PHẦN\s+I\./i));
   const header2Segment = segments.find(s => s.type === 'static' && s.textContent.match(/PHẦN\s+II\./i));
   const header3Segment = segments.find(s => s.type === 'static' && s.textContent.match(/PHẦN\s+III\./i));
+  // Tìm header cho Phần 4
+  const header4Segment = segments.find(s => s.type === 'static' && (s.textContent.match(/PHẦN\s+(IV|4)\./i) || s.textContent.match(/TỰ\s+LUẬN/i)));
   
   let preambleSegments: DocSegment[] = [];
   if (!headerConfig?.enabled) {
     for (const s of segments) {
       if (s.type === 'question') break;
-      if (s === header1Segment || s === header2Segment || s === header3Segment) break;
+      if (s === header1Segment || s === header2Segment || s === header3Segment || s === header4Segment) break;
       if (s.type === 'static') preambleSegments.push(s);
     }
   }
@@ -887,7 +1043,9 @@ export const generateVariants = async (
   for (let i = 1; i <= count; i++) {
     const variantCode = (startCode + i - 1).toString();
     const variantAnswers: Record<number, string> = {};
-    let globalStt = 1;
+    
+    // Global counter for Excel rows (keeps absolute index 1..N)
+    let globalExcelStt = 1;
 
     const variantDoc = xmlDoc.cloneNode(true) as Document;
     const variantBody = variantDoc.getElementsByTagName("w:body")[0];
@@ -903,7 +1061,7 @@ export const generateVariants = async (
              // APPLY STYLE for Section Headers "PHẦN ..."
              if (styleHeader) {
                  const traverse = (n: Node) => {
-                     if (n.nodeName === "w:t" && n.textContent && n.textContent.match(/^PHẦN\s+[IVX]+\./i)) {
+                     if (n.nodeName === "w:t" && n.textContent && (n.textContent.match(/^PHẦN\s+[IVX]+\./i) || n.textContent.match(/TỰ\s+LUẬN/i))) {
                          if (n.parentNode && n.parentNode.nodeName === "w:r") {
                             applyRunStyle(n.parentNode as Element, { bold: true, color: "0000FF" });
                          }
@@ -931,7 +1089,7 @@ export const generateVariants = async (
         preambleSegments.forEach(s => appendXmlContent(s.xmlContent));
     }
 
-    const appendQuestions = (qs: QuestionBlock[], balancedMCQKeys: string[]) => {
+    const appendQuestions = (qs: QuestionBlock[], balancedMCQKeys: string[], getNextLabel: () => number) => {
        qs.forEach((q, idx) => {
         let qNodes: Element[] = [];
         q.xmlContent.forEach(str => {
@@ -941,7 +1099,11 @@ export const generateVariants = async (
             });
         });
 
-        if (qNodes.length > 0) replaceQuestionLabel(qNodes[0], globalStt);
+        if (qNodes.length > 0) {
+            // Get the SECTION-relative number for display in DOCX
+            const displayLabel = getNextLabel();
+            replaceQuestionLabel(qNodes[0], displayLabel);
+        }
         
         if (mixOptions.shuffleOptions) {
             if (q.type === QuestionType.MCQ) {
@@ -956,11 +1118,15 @@ export const generateVariants = async (
             } else if (q.type === QuestionType.TRUE_FALSE) {
                qNodes = shuffleQuestionOptions(qNodes, q.type);
             }
+            // ESSAY questions don't have options to shuffle, they are just rendered
         }
 
+        // Get Answer Key
         const ans = getAnswerFromNodes(qNodes, q.type, q.textContent);
-        variantAnswers[globalStt] = ans;
-        globalStt++;
+        
+        // Store answer using GLOBAL STT for Excel continuity
+        variantAnswers[globalExcelStt] = ans;
+        globalExcelStt++;
 
         qNodes.forEach(node => {
             const removeTags = (tagName: string) => {
@@ -971,7 +1137,9 @@ export const generateVariants = async (
             removeTags("w:color");
             removeTags("w:highlight");
             removeTags("w:shd");
-            cleanTextContent(node);
+            
+            // Clean Key tags robustly
+            cleanKeyTagFromParagraph(node);
         });
 
         qNodes.forEach(node => variantBody.appendChild(node));
@@ -979,26 +1147,34 @@ export const generateVariants = async (
     };
 
     // Helper to shuffle questions WITHIN a section BY TYPE
-    const processSectionGroup = (groupQuestions: QuestionBlock[]) => {
+    const processSectionGroup = (groupQuestions: QuestionBlock[], keepOrder: boolean = false) => {
+       // RESET STT COUNTER FOR EACH SECTION
+       let sectionLabelCounter = 1;
+       const getNextLabel = () => sectionLabelCounter++;
+
        const mcqs = groupQuestions.filter(q => q.type === QuestionType.MCQ);
        const tfs = groupQuestions.filter(q => q.type === QuestionType.TRUE_FALSE);
        const sas = groupQuestions.filter(q => q.type === QuestionType.SHORT_ANSWER);
+       const essays = groupQuestions.filter(q => q.type === QuestionType.ESSAY);
        const unknowns = groupQuestions.filter(q => q.type === QuestionType.UNKNOWN);
 
-       const finalMCQs = mixOptions.shuffleQuestions ? shuffleArray([...mcqs]) : [...mcqs];
-       const finalTFs = mixOptions.shuffleQuestions ? shuffleArray([...tfs]) : [...tfs];
-       const finalSAs = mixOptions.shuffleQuestions ? shuffleArray([...sas]) : [...sas];
+       // Shuffle logic based on mixOptions AND keepOrder override
+       const doShuffle = mixOptions.shuffleQuestions && !keepOrder;
+
+       const finalMCQs = doShuffle ? shuffleArray([...mcqs]) : [...mcqs];
+       const finalTFs = doShuffle ? shuffleArray([...tfs]) : [...tfs];
+       const finalSAs = doShuffle ? shuffleArray([...sas]) : [...sas];
+       const finalEssays = doShuffle ? shuffleArray([...essays]) : [...essays];
        
-       // Generate keys ONLY for the MCQs in this section to ensure balance within this section (if large enough)
-       // or at least contribute to randomness. 
-       // Note: To balance nicely, ideally we balance across the whole test, but balancing per section is safer for structure.
+       // Generate keys ONLY for the MCQs in this section
        const balancedKeys = mixOptions.shuffleOptions ? generateBalancedKeys(finalMCQs.length) : [];
 
-       // Append in specific order: MCQ -> TF -> SA -> Unknown (standard practice)
-       appendQuestions(finalMCQs, balancedKeys);
-       appendQuestions(finalTFs, []);
-       appendQuestions(finalSAs, []);
-       appendQuestions(unknowns, []);
+       // Append in specific order: MCQ -> TF -> SA -> Essay -> Unknown
+       appendQuestions(finalMCQs, balancedKeys, getNextLabel);
+       appendQuestions(finalTFs, [], getNextLabel);
+       appendQuestions(finalSAs, [], getNextLabel);
+       appendQuestions(finalEssays, [], getNextLabel);
+       appendQuestions(unknowns, [], getNextLabel);
     };
 
     // Render Part I
@@ -1012,6 +1188,10 @@ export const generateVariants = async (
     // Render Part III
     if (header3Segment) appendXmlContent(header3Segment.xmlContent, true);
     processSectionGroup(p3Questions);
+
+    // Render Part IV (Tự luận) -> FORCE NO SHUFFLE (keepOrder = true)
+    if (header4Segment) appendXmlContent(header4Segment.xmlContent, true);
+    processSectionGroup(p4Questions, true);
 
     // Render Remaining/Other
     if (otherQuestions.length > 0) {

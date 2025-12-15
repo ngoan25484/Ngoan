@@ -11,7 +11,7 @@ const sanitizeContent = (questions: QuestionBlock[]) => {
 };
 
 export const checkContentWithGemini = async (questions: QuestionBlock[]): Promise<string> => {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.API_KEY;
   if (!apiKey) {
     return "API Key chưa được cấu hình.";
   }
